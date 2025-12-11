@@ -1,128 +1,268 @@
-import streamlit as st
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import ta
+import streamlit as st
 import pickle
+import os
+import ta
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import r2_score
 from keras.models import load_model
 import plotly.graph_objects as go
+from datetime import datetime
 
 
-# ------------------ FETCH DATA ------------------
-def fetch_stock_data(symbol, start="2005-01-01", end="2025-01-01"):
-    df = yf.download(symbol, start=start, end=end)
-
-    df["MA20"] = ta.trend.sma_indicator(df["Close"], 20)
-    df["MA50"] = ta.trend.sma_indicator(df["Close"], 50)
-    df["RSI"] = ta.momentum.rsi(df["Close"], 14)
-    df["Volume_MA20"] = df["Volume"].rolling(20).mean()
-    df["ATR_14"] = ta.volatility.average_true_range(df["High"], df["Low"], df["Close"], 14)
-    df["ADX_14"] = ta.trend.adx(df["High"], df["Low"], df["Close"], 14)
-    df["BB_WIDTH"] = ta.volatility.bollinger_wband(df["Close"], 20, 2)
-
-    df.dropna(inplace=True)
-    return df
+st.set_page_config(page_title="Stock Predictor", layout="wide")
+st.title("(Keras/TensorFlow)")
 
 
-# ------------------ CREATE SEQUENCES ------------------
+# ----------------------------------------------------------
+#  FETCH STOCK DATA
+# ----------------------------------------------------------
+def fetch_stock_data(symbol, start, end):
+    try:
+        df = yf.download(symbol, start=start, end=end, progress=False, threads=False)
+
+        if df is None or df.empty:
+            return None
+
+        close = df["Close"]
+        volume = df["Volume"]
+        high = df["High"]
+        low = df["Low"]
+
+        df["MA20"] = ta.trend.sma_indicator(close, window=20)
+        df["MA50"] = ta.trend.sma_indicator(close, window=50)
+        df["RSI"] = ta.momentum.rsi(close, window=14)
+        df["Volume_MA20"] = volume.rolling(window=20).mean()
+        df["ATR_14"] = ta.volatility.average_true_range(high, low, close, window=14)
+        df["ADX_14"] = ta.trend.adx(high, low, close, window=14)
+        df["BB_WIDTH"] = ta.volatility.bollinger_wband(close, window=20, window_dev=2)
+
+        df.dropna(inplace=True)
+        return df
+
+    except Exception as e:
+        print("YFinance Error:", e)
+        return None
+
+
+# ----------------------------------------------------------
+#  CREATE SEQUENCES
+# ----------------------------------------------------------
 def create_sequences(data, window=100):
     x, y = [], []
     for i in range(window, len(data)):
-        x.append(data[i-window:i])
+        x.append(data[i - window:i])
         y.append(data[i, 0])
     return np.array(x), np.array(y)
 
 
-# ------------------ LOAD MODEL + SCALER ------------------
-def load_model_and_scaler(symbol):
-    model = load_model(f"models/{symbol}_model.h5")
-    scaler = pickle.load(open(f"models/{symbol}_scaler.pkl", "rb"))
-    return model, scaler
+# ----------------------------------------------------------
+#  LOAD MODELS
+# ----------------------------------------------------------
+def load_models(symbols):
+    models = []
+    for s in symbols:
+        model_path = f"models/{s}_model.h5"
+        scaler_path = f"models/{s}_scaler.pkl"
+
+        if not os.path.exists(model_path):
+            continue
+
+        model = load_model(model_path)
+
+        with open(scaler_path, "rb") as f:
+            scaler = pickle.load(f)
+
+        models.append({"symbol": s, "model": model, "scaler": scaler})
+
+    return models
 
 
-# ------------------ PREDICT TOMORROW ------------------
-def predict_tomorrow(symbol):
-    df = fetch_stock_data(symbol)
-    features = ["Close","MA20","MA50","RSI","Volume_MA20","ATR_14","ADX_14","BB_WIDTH"]
-    df = df[features]
+# ----------------------------------------------------------
+#  PREDICT TOMORROW PRICE
+# ----------------------------------------------------------
+def predict_tomorrow(symbol, trained_models, window=100):
+    df = fetch_stock_data(symbol, "2010-01-01", datetime.today().strftime("%Y-%m-%d"))
 
-    model, scaler = load_model_and_scaler(symbol)
+    if df is None or df.empty:
+        st.error("Failed to fetch stock data.")
+        return None
 
-    scaled = scaler.transform(df)
-    last_seq = scaled[-100:].reshape(1, 100, len(features))
+    features = ["Close", "MA20", "MA50", "RSI", "Volume_MA20", "ATR_14", "ADX_14", "BB_WIDTH"]
+    df = df[features].dropna()
 
-    pred_scaled = model.predict(last_seq, verbose=0)[0][0]
+    best_r2 = -np.inf
+    best_pred = None
 
-    # invert scaling
-    close_scale = scaler.scale_[0]
-    close_min = scaler.min_[0]
+    for entry in trained_models:
+        model = entry["model"]
+        scaler = entry["scaler"]
 
-    pred_real = pred_scaled / close_scale + close_min
-    return pred_real
+        try:
+            data_scaled = scaler.transform(df)
+        except:
+            continue
+
+        if len(data_scaled) < window:
+            continue
+
+        last_window = data_scaled[-window:].reshape(1, window, data_scaled.shape[1])
+        y_scaled = model.predict(last_window, verbose=0).flatten()[0]
+
+        # inverse transform
+        y_pred = y_scaled / scaler.scale_[0] + scaler.min_[0]
+
+        # compute recent R2
+        x_recent, y_true = create_sequences(data_scaled, window)
+        pred_recent = model.predict(x_recent, verbose=0).flatten()
+
+        pred_recent = pred_recent / scaler.scale_[0] + scaler.min_[0]
+        y_true = np.array(y_true) / scaler.scale_[0] + scaler.min_[0]
+
+        r2 = r2_score(y_true, pred_recent)
+
+        if r2 > best_r2:
+            best_r2 = r2
+            best_pred = y_pred
+
+    return best_pred
 
 
-# ------------------ PREDICT RANGE ------------------
-def predict_range(symbol, start, end):
+# ----------------------------------------------------------
+#  PREDICT RANGE (with graph)
+# ----------------------------------------------------------
+def predict_range(symbol, start, end, trained_models, window=100):
     df = fetch_stock_data(symbol, start, end)
-    features = ["Close","MA20","MA50","RSI","Volume_MA20","ATR_14","ADX_14","BB_WIDTH"]
 
-    df_feat = df[features]
-    model, scaler = load_model_and_scaler(symbol)
+    if df is None or df.empty:
+        st.error("Failed to fetch stock data.")
+        return None, None
 
-    scaled = scaler.transform(df_feat)
-    x, y_true = create_sequences(scaled)
+    features = ["Close", "MA20", "MA50", "RSI", "Volume_MA20", "ATR_14", "ADX_14", "BB_WIDTH"]
+    df = df[features].dropna()
 
-    preds_scaled = model.predict(x, verbose=0).flatten()
+    best_r2 = -np.inf
+    best_y_pred = None
+    best_y_true = None
 
-    close_scale = scaler.scale_[0]
-    close_min = scaler.min_[0]
+    for entry in trained_models:
+        model = entry["model"]
+        scaler = entry["scaler"]
 
-    preds = preds_scaled / close_scale + close_min
-    y_true = np.array(y_true) / close_scale + close_min
+        try:
+            scaled = scaler.transform(df)
+        except:
+            continue
 
-    return preds, y_true
+        x_new, y_true = create_sequences(scaled, window)
+        if len(x_new) == 0:
+            continue
+
+        y_scaled = model.predict(x_new, verbose=0).flatten()
+
+        # inverse scale
+        y_pred = y_scaled / scaler.scale_[0] + scaler.min_[0]
+        y_true_rescaled = y_true / scaler.scale_[0] + scaler.min_[0]
+
+        r2 = r2_score(y_true_rescaled, y_pred)
+
+        if r2 > best_r2:
+            best_r2 = r2
+            best_y_pred = y_pred
+            best_y_true = y_true_rescaled
+
+    return best_y_pred, best_y_true
 
 
-# ------------------ STREAMLIT UI ------------------
-st.title("📈 Stock Predictor (Keras/TensorFlow)")
+# ----------------------------------------------------------
+# MODEL GROUPS
+# ----------------------------------------------------------
+group_less = ["MAXHEALTH.NS", "IDEA.NS", "ITC.NS", "TATAMOTORS.NS"]
+group_mid = ["ICICIBANK.NS", "HDFCBANK.NS", "SIEMENS.NS", "HEROMOTOCO.NS"]
+group_more = ["MRF.NS", "BAJFINANCE.NS", "POWERINDIA.NS", "PAGEIND.NS"]
 
+all_models = {
+    "less": load_models(group_less),
+    "mid": load_models(group_mid),
+    "more": load_models(group_more),
+}
+
+
+# ----------------------------------------------------------
+#   STREAMLIT UI
+# ----------------------------------------------------------
 tab1, tab2 = st.tabs(["Predict Tomorrow", "Predict Range"])
 
 
-# ---------- TAB 1: Tomorrow Prediction ----------
+# ==========================================================
+#  TAB 1 — TOMORROW PRICE
+# ==========================================================
 with tab1:
-    symbol = st.text_input("Enter NSE Symbol", "HDFCBANK.NS")
+    st.header("Predict Tomorrow")
+
+    symbol = st.text_input("Symbol", "HDFCBANK.NS")
 
     if st.button("Predict Tomorrow"):
-        try:
-            pred = predict_tomorrow(symbol)
-            st.success(f"Predicted price for tomorrow: ₹{pred:.2f}")
-        except Exception as e:
-            st.error(f"Error: {e}")
+        latest = yf.download(symbol, period="5d")
+        if latest.empty:
+            st.error("Invalid symbol or no recent data.")
+        else:
+            price = float(latest["Close"].iloc[-1])
+
+            if price <= 800:
+                models_group = all_models["less"]
+            elif price <= 3000:
+                models_group = all_models["mid"]
+            else:
+                models_group = all_models["more"]
+
+            pred = predict_tomorrow(symbol, models_group)
+
+            if pred is not None:
+                st.success(f"Tomorrow's predicted close price: ₹{pred:.2f}")
+            else:
+                st.error("Prediction failed.")
 
 
-# ---------- TAB 2: Range Prediction ----------
+# ==========================================================
+#  TAB 2 — RANGE PREDICTION
+# ==========================================================
 with tab2:
-    symbol_r = st.text_input("Symbol", "HDFCBANK.NS", key="r")
-    start = st.date_input("Start Date")
-    end = st.date_input("End Date")
+    st.header("Predict Range")
+
+    symbol = st.text_input("Symbol", "HDFCBANK.NS", key="range_symbol")
+    start = st.text_input("Start Date", "2015-01-01")
+    end = st.text_input("End Date", "2025-01-01")
 
     if st.button("Predict Range"):
-        try:
-            preds, actual = predict_range(symbol_r, str(start), str(end))
+        latest = yf.download(symbol, period="5d")
 
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(y=actual, name="Actual Price"))
-            fig.add_trace(go.Scatter(y=preds, name="Predicted Price"))
+        if latest.empty:
+            st.error("Invalid symbol.")
+        else:
+            price = float(latest["Close"].iloc[-1])
 
-            fig.update_layout(
-                title=f"Actual vs Predicted — {symbol_r}",
-                xaxis_title="Days",
-                yaxis_title="Price (INR)"
-            )
+            if price <= 800:
+                models_group = all_models["less"]
+            elif price <= 3000:
+                models_group = all_models["mid"]
+            else:
+                models_group = all_models["more"]
 
-            st.plotly_chart(fig)
+            y_pred, y_true = predict_range(symbol, start, end, models_group)
 
-        except Exception as e:
-            st.error(f"Error: {e}")
+            if y_pred is None:
+                st.error("Prediction failed.")
+            else:
+                # reshape to 1D
+                y_pred = np.array(y_pred).reshape(-1)
+                y_true = np.array(y_true).reshape(-1)
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(y=y_true, name="Actual"))
+                fig.add_trace(go.Scatter(y=y_pred, name="Predicted"))
+                fig.update_layout(title=f"{symbol} Prediction", height=500)
+
+                st.plotly_chart(fig, use_container_width=True)
