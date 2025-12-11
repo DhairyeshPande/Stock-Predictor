@@ -13,7 +13,6 @@ from datetime import datetime
 
 
 st.set_page_config(page_title="Stock Predictor", layout="wide")
-st.title("(Keras/TensorFlow)")
 
 
 # ----------------------------------------------------------
@@ -266,3 +265,4 @@ with tab2:
                 fig.update_layout(title=f"{symbol} Prediction", height=500)
 
                 st.plotly_chart(fig, use_container_width=True)
+
