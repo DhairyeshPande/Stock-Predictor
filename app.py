@@ -1,139 +1,145 @@
+import os
+import pickle
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import streamlit as st
-import pickle
-import os
+import FinanceDataReader as fdr
 import ta
-import time
-from datetime import datetime
+import streamlit as st
+import plotly.graph_objects as go
 from sklearn.metrics import r2_score
 from keras.models import load_model
-import plotly.graph_objects as go
+from datetime import datetime
+import time
 
+st.set_page_config(page_title="Stock Price Predictor", layout="wide")
 
-st.set_page_config(page_title="Stock Predictor", layout="wide")
-st.title("(Keras/TensorFlow) Stock Predictor")
-
-
-# ===================================================================
-#  SAFE FETCH FUNCTION WITH RETRIES (FIXES RATE LIMIT ERRORS)
-# ===================================================================
+# ==========================================================
+#   FETCH STOCK DATA  (Yahoo → FDR fallback)
+# ==========================================================
 def fetch_stock_data(symbol, start, end, retries=3):
+    df = None
+
+    # ---- Try Yahoo Finance first ----
     for attempt in range(retries):
         try:
             df = yf.download(
-                symbol,
-                start=start,
-                end=end,
-                interval="1d",
-                progress=False,
-                threads=False,
+                symbol, start=start, end=end,
+                interval="1d", progress=False, threads=False
             )
-
             if df is not None and not df.empty:
-                close = df["Close"]
-                volume = df["Volume"]
-                high = df["High"]
-                low = df["Low"]
+                break
+        except:
+            pass
+        time.sleep(1)
 
-                df["MA20"] = ta.trend.sma_indicator(close, window=20)
-                df["MA50"] = ta.trend.sma_indicator(close, window=50)
-                df["RSI"] = ta.momentum.rsi(close, window=14)
-                df["Volume_MA20"] = volume.rolling(window=20).mean()
-                df["ATR_14"] = ta.volatility.average_true_range(high, low, close, window=14)
-                df["ADX_14"] = ta.trend.adx(high, low, close, window=14)
-                df["BB_WIDTH"] = ta.volatility.bollinger_wband(close, window=20, window_dev=2)
+    # ---- If Yahoo fails, use FDR ----
+    if df is None or df.empty:
+        try:
+            s = symbol.replace(".NS", "")
+            df = fdr.DataReader(s, start, end)
+            if df is None or df.empty:
+                return None
 
-                df.dropna(inplace=True)
-                return df
+            df.rename(columns={
+                "Open": "Open",
+                "High": "High",
+                "Low": "Low",
+                "Close": "Close",
+                "Volume": "Volume"
+            }, inplace=True)
+        except:
+            return None
 
-        except Exception as e:
-            print(f"Fetch error (attempt {attempt+1}):", e)
+    # ---- Add technical indicators ----
+    try:
+        close = df["Close"]
+        high = df["High"]
+        low = df["Low"]
+        volume = df["Volume"]
 
-        time.sleep(1)  # retry delay
+        df["MA20"] = ta.trend.sma_indicator(close, window=20)
+        df["MA50"] = ta.trend.sma_indicator(close, window=50)
+        df["RSI"] = ta.momentum.rsi(close, window=14)
+        df["Volume_MA20"] = volume.rolling(20).mean()
+        df["ATR_14"] = ta.volatility.average_true_range(high, low, close, 14)
+        df["ADX_14"] = ta.trend.adx(high, low, close, 14)
+        df["BB_WIDTH"] = ta.volatility.bollinger_wband(close, 20, 2)
 
-    return None
+        df.dropna(inplace=True)
+    except:
+        return None
+
+    return df
 
 
-# ===================================================================
-#  SEQUENCE CREATION
-# ===================================================================
+# ==========================================================
+#   HELPERS — SEQUENCE CREATION
+# ==========================================================
 def create_sequences(data, window=100):
-    x, y = [], []
+    X, Y = [], []
     for i in range(window, len(data)):
-        x.append(data[i - window:i])
-        y.append(data[i, 0])
-    return np.array(x), np.array(y)
+        X.append(data[i - window:i])
+        Y.append(data[i, 0])
+    return np.array(X), np.array(Y)
 
 
-# ===================================================================
-#  LOAD MODELS FROM /models
-# ===================================================================
-def load_models(symbols):
-    models = []
-
+# ==========================================================
+#   LOAD MODELS FROM /models
+# ==========================================================
+def load_models(symbols, model_dir="models"):
+    out = []
     for s in symbols:
-        model_path = f"models/{s}_model.h5"
-        scaler_path = f"models/{s}_scaler.pkl"
+        model_path = f"{model_dir}/{s}_model.h5"
+        scaler_path = f"{model_dir}/{s}_scaler.pkl"
 
         if not os.path.exists(model_path) or not os.path.exists(scaler_path):
+            print(f"Missing model files for: {s}")
             continue
 
         model = load_model(model_path)
-
         with open(scaler_path, "rb") as f:
             scaler = pickle.load(f)
 
-        models.append({"symbol": s, "model": model, "scaler": scaler})
+        out.append({"symbol": s, "model": model, "scaler": scaler})
+    return out
 
-    return models
 
-
-# ===================================================================
-#  PREDICT TOMORROW
-# ===================================================================
-def predict_tomorrow(symbol, trained_models, window=100):
-
-    df = fetch_stock_data(symbol, "2010-01-01", datetime.today().strftime("%Y-%m-%d"))
-
+# ==========================================================
+#   PREDICT TOMORROW PRICE
+# ==========================================================
+def predict_tomorrow(symbol, models_group, window=100):
+    df = fetch_stock_data(symbol, "2010-01-01", "2025-01-01")
     if df is None or df.empty:
         return None
 
-    features = ["Close", "MA20", "MA50", "RSI", "Volume_MA20",
-                "ATR_14", "ADX_14", "BB_WIDTH"]
+    features = ["Close", "MA20", "MA50", "RSI",
+                "Volume_MA20", "ATR_14", "ADX_14", "BB_WIDTH"]
 
     df = df[features].dropna()
+    if len(df) < window:
+        return None
 
-    best_r2 = -np.inf
     best_pred = None
+    best_r2 = -1
 
-    for entry in trained_models:
+    for entry in models_group:
         model = entry["model"]
         scaler = entry["scaler"]
 
-        try:
-            scaled = scaler.transform(df)
-        except:
-            continue
+        arr = scaler.transform(df)
+        last_window = arr[-window:].reshape(1, window, arr.shape[1])
 
-        if len(scaled) < window:
-            continue
-
-        last_window = scaled[-window:].reshape(1, window, scaled.shape[1])
         pred_scaled = model.predict(last_window, verbose=0).flatten()[0]
-
-        # invert scale
         pred = pred_scaled / scaler.scale_[0] + scaler.min_[0]
 
-        # compute R2 for ranking models
-        x_recent, y_true = create_sequences(scaled, window)
-        pred_recent = model.predict(x_recent, verbose=0).flatten()
+        X_recent, y_true = create_sequences(arr, window)
+        y_pred_recent = model.predict(X_recent, verbose=0).flatten()
 
-        pred_recent = pred_recent / scaler.scale_[0] + scaler.min_[0]
+        y_pred_recent = y_pred_recent / scaler.scale_[0] + scaler.min_[0]
         y_true = y_true / scaler.scale_[0] + scaler.min_[0]
 
-        r2 = r2_score(y_true, pred_recent)
+        r2 = r2_score(y_true, y_pred_recent)
 
         if r2 > best_r2:
             best_r2 = r2
@@ -142,148 +148,117 @@ def predict_tomorrow(symbol, trained_models, window=100):
     return best_pred
 
 
-# ===================================================================
-#  PREDICT RANGE
-# ===================================================================
-def predict_range(symbol, start, end, trained_models, window=100):
-
+# ==========================================================
+#   PREDICT RANGE
+# ==========================================================
+def predict_range(symbol, start, end, models_group, window=100):
     df = fetch_stock_data(symbol, start, end)
-
     if df is None or df.empty:
-        return None, None
+        return None, None, None
 
-    features = ["Close", "MA20", "MA50", "RSI", "Volume_MA20",
-                "ATR_14", "ADX_14", "BB_WIDTH"]
+    features = ["Close", "MA20", "MA50", "RSI",
+                "Volume_MA20", "ATR_14", "ADX_14", "BB_WIDTH"]
 
     df = df[features].dropna()
+    if len(df) < window:
+        return None, None, None
 
-    best_r2 = -np.inf
-    best_y_pred = None
-    best_y_true = None
+    best_result = None
+    best_r2 = -1
 
-    for entry in trained_models:
+    for entry in models_group:
         model = entry["model"]
         scaler = entry["scaler"]
 
         try:
-            scaled = scaler.transform(df)
+            arr = scaler.transform(df)
         except:
             continue
 
-        x_new, y_true = create_sequences(scaled, window)
-        if len(x_new) == 0:
+        X_new, y_true = create_sequences(arr, window)
+        if len(X_new) == 0:
             continue
 
-        pred_scaled = model.predict(x_new, verbose=0).flatten()
+        pred_scaled = model.predict(X_new, verbose=0).flatten()
+        pred = pred_scaled / scaler.scale_[0] + scaler.min_[0]
+        y_true = y_true / scaler.scale_[0] + scaler.min_[0]
 
-        # invert scale
-        y_pred = pred_scaled / scaler.scale_[0] + scaler.min_[0]
-        y_true_rescaled = y_true / scaler.scale_[0] + scaler.min_[0]
-
-        r2 = r2_score(y_true_rescaled, y_pred)
+        r2 = r2_score(y_true, pred)
 
         if r2 > best_r2:
             best_r2 = r2
-            best_y_pred = y_pred
-            best_y_true = y_true_rescaled
+            best_result = (pred, y_true, df)
 
-    return best_y_pred, best_y_true
+    return best_result
 
 
-# ===================================================================
-#  MODEL GROUPS
-# ===================================================================
+# ==========================================================
+#   MODEL GROUPS
+# ==========================================================
 group_less = ["MAXHEALTH.NS", "IDEA.NS", "ITC.NS", "TATAMOTORS.NS"]
 group_mid = ["ICICIBANK.NS", "HDFCBANK.NS", "SIEMENS.NS", "HEROMOTOCO.NS"]
 group_more = ["MRF.NS", "BAJFINANCE.NS", "POWERINDIA.NS", "PAGEIND.NS"]
 
 all_models = {
-    "less": load_models(group_less),
+    "low": load_models(group_less),
     "mid": load_models(group_mid),
-    "more": load_models(group_more),
+    "high": load_models(group_more),
 }
 
 
-# ===================================================================
-#  STREAMLIT UI
-# ===================================================================
-tab1, tab2 = st.tabs(["Predict Tomorrow", "Predict Range"])
-
-
 # ==========================================================
-#  TAB 1 — TOMORROW PRICE
+#   UI — STREAMLIT
 # ==========================================================
+st.title("📈 Stock Price Predictor")
+
+tab1, tab2 = st.tabs(["🔮 Predict Tomorrow", "📆 Predict Price Range"])
+
+# ------------------------
+# TAB 1 – Tomorrow
+# ------------------------
 with tab1:
-    st.header("Predict Tomorrow Price")
+    st.subheader("Predict Tomorrow's Closing Price")
 
-    symbol = st.text_input("Symbol (NSE)", "HDFCBANK.NS")
+    symbol = st.text_input("Enter NSE Symbol (e.g., HDFCBANK.NS)", "")
 
     if st.button("Predict Tomorrow"):
-        # Try fetching latest price safely
-        latest = yf.download(symbol, period="5d",
-                             progress=False, threads=False)
-
-        if latest is None or latest.empty:
-            st.error("Failed to fetch recent price. Try again.")
+        if symbol.strip() == "":
+            st.error("Please enter a valid symbol.")
         else:
-            price = float(latest["Close"].iloc[-1])
-
-            # determine group
-            if price <= 800:
-                models_group = all_models["less"]
-            elif price <= 3000:
-                models_group = all_models["mid"]
+            price = predict_tomorrow(symbol, all_models["mid"])
+            if price is None:
+                st.error("Prediction failed.")
             else:
-                models_group = all_models["more"]
-
-            pred = predict_tomorrow(symbol, models_group)
-
-            if pred is None:
-                st.error("Prediction failed due to missing data.")
-            else:
-                st.success(f"Tomorrow's predicted close price: ₹{pred:.2f}")
+                st.success(f"Predicted closing price: **₹{price:.2f}**")
 
 
-# ==========================================================
-#  TAB 2 — RANGE PREDICTION
-# ==========================================================
+# ------------------------
+# TAB 2 – Range Prediction
+# ------------------------
 with tab2:
-    st.header("Predict Price Range")
+    st.subheader("Predict Price Range")
 
-    symbol = st.text_input("Symbol", "HDFCBANK.NS", key="range_symbol")
+    symbol = st.text_input("Symbol", key="range_symbol")
     start = st.text_input("Start Date (YYYY-MM-DD)", "2015-01-01")
     end = st.text_input("End Date (YYYY-MM-DD)", "2025-01-01")
 
     if st.button("Predict Range"):
-        # Fetch price for grouping
-        latest = yf.download(symbol, period="5d",
-                             progress=False, threads=False)
-
-        if latest is None or latest.empty:
-            st.error("Failed to fetch stock data.")
+        result = predict_range(symbol, start, end, all_models["mid"])
+        if result is None:
+            st.error("Prediction failed.")
         else:
-            price = float(latest["Close"].iloc[-1])
+            pred, truth, dfp = result
+            st.success("Prediction Completed")
 
-            if price <= 800:
-                models_group = all_models["less"]
-            elif price <= 3000:
-                models_group = all_models["mid"]
-            else:
-                models_group = all_models["more"]
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(y=truth, name="Actual"))
+            fig.add_trace(go.Scatter(y=pred, name="Predicted"))
 
-            y_pred, y_true = predict_range(symbol, start, end, models_group)
+            fig.update_layout(
+                title=f"{symbol} – Price Prediction",
+                height=500,
+                xaxis_title="Days",
+                yaxis_title="Price (₹)"
+            )
 
-            if y_pred is None:
-                st.error("Prediction failed.")
-            else:
-                y_pred = np.array(y_pred).reshape(-1)
-                y_true = np.array(y_true).reshape(-1)
-
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(y=y_true, name="Actual"))
-                fig.add_trace(go.Scatter(y=y_pred, name="Predicted"))
-
-                fig.update_layout(title=f"{symbol} — Prediction Range",
-                                  height=500)
-
-                st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
