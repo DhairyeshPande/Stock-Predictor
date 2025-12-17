@@ -1,11 +1,10 @@
-yfinance
-finance-datareader
+streamlit
 pandas
 numpy
-keras
-tensorflow
-scikit-learn==1.6.1
+yfinance
+matplotlib
+scikit-learn
 ta
+tensorflow==2.18.0
+keras==3.8.0
 plotly
-streamlit
-
